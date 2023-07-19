@@ -35,6 +35,7 @@ Welcome to ablator's documentation!
    :caption: Intermediate Tutorials
 
    notebooks/Searchspace-for-diff-optimizers.ipynb
+   notebooks/Multi-Modules.ipynb
 
 Indices and tables
 ==================
