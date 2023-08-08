@@ -1,8 +1,5 @@
-import functools
-import json
 import multiprocessing as mp
 import traceback
-import typing as ty
 from logging import warning
 from pathlib import Path
 import builtins
@@ -13,63 +10,11 @@ import ray
 from joblib import Memory
 
 from ablator.config.main import ConfigBase
-from ablator.main.configs import Optim, ParallelConfig, SearchSpace
+from ablator.config.mp import Optim, ParallelConfig, SearchSpace
+from ablator.config.proto import RunConfig
 
 
-def process_row(row: str, **aux_info) -> dict[str, ty.Any] | None:
-    """
-    Process a given row to make it conform to the JSON format, loading it as a JSON object,
-    and updating it with auxiliary information.
-
-    Parameters
-    ----------
-    row : str
-        The input row to be processed, expected to be a JSON-like string.
-    **aux_info : dict
-        Additional key-value pairs to be added to the resulting dictionary.
-
-    Returns
-    -------
-    dict[str, ty.Any] | None
-        A dictionary resulting from the combination of the processed row and auxiliary information,
-        or ``None`` if the input row cannot be parsed as a JSON object.
-
-    Raises
-    ------
-    AssertionError
-        If there are overlapping column names between the auxiliary information and the input row.
-
-    Examples
-    --------
-    >>> row = '"name": "John Doe", "age": 30'
-    >>> aux_info = {"city": "San Francisco"}
-    >>> process_row(row, **aux_info)
-    {'name': 'John Doe', 'age': 30, 'city': 'San Francisco'}
-
-    >>> row = '{"name": "John Doe", "age": 30}'
-    >>> aux_info = {"age": 25, "city": "San Francisco"}
-    >>> process_row(row, **aux_info)
-    AssertionError: Overlapping column names between auxiliary dictionary and run results.
-    aux_info: {'age': 25, 'city': 'San Francisco'}
-    row: {"name": "John Doe", "age": 30}
-    """
-    if not row.startswith("{"):
-        row = "{" + row
-    if not row.endswith("}") and not row.endswith("}\n"):
-        row += "}"
-    s: dict[str, ty.Any] = {}
-    try:
-        s = json.loads(row)
-    except json.decoder.JSONDecodeError:
-        return None
-    assert (
-        len(list(filter(lambda k: k in s, aux_info.keys()))) == 0
-    ), f"Overlapping column names between auxilary dictionary and run results. aux_info: {aux_info}\n\nrow:{row} "
-    s.update(aux_info)
-    return s
-
-
-def read_result(config_type: type[ConfigBase], json_path: Path) -> pd.DataFrame:
+def read_result(config_type: type[ConfigBase], json_path: Path) -> pd.DataFrame | None:
     """
     Read the results of an experiment and return them as a pandas DataFrame.
 
@@ -87,15 +32,10 @@ def read_result(config_type: type[ConfigBase], json_path: Path) -> pd.DataFrame:
 
     Returns
     -------
-    pd.DataFrame
+    pd.DataFrame | None
         A pandas DataFrame containing the processed experiment results.
+        Returns None if there was an error in reading the json_path results.
 
-    Raises
-    ------
-    Exception
-        If there is an error in processing the JSON file or loading the
-        experiment configuration, the exception will be caught and the
-        traceback will be printed.
 
     Examples
     --------
@@ -124,25 +64,14 @@ def read_result(config_type: type[ConfigBase], json_path: Path) -> pd.DataFrame:
         experiment_attributes = experiment_config.make_dict(
             experiment_config.annotations, flatten=True
         )
+        df = pd.read_json(json_path)
+        df = pd.concat([pd.DataFrame([experiment_attributes] * len(df)), df], axis=1)
+        df.index.name = "step"
+        df.reset_index(inplace=True)
+        df["trial_uid"] = json_path.parent.name
+        return df.set_index(["trial_uid", "step"])
 
-        with open(json_path, "r", encoding="utf-8") as f:
-            lines = f.read().split("}\n{")
-
-        _process_row = functools.partial(
-            process_row,
-            **{
-                **experiment_attributes,
-                **{"path": json_path.parent.as_posix()},
-            },
-        )
-        processed_rows = [_process_row(l) for l in lines]  # noqa
-        processed_jsons = list(filter(lambda x: x is not None, processed_rows))
-        df = pd.DataFrame(processed_jsons)
-
-        if (malformed_rows := len(processed_rows) - len(processed_jsons)) > 0:
-            print(f"Found {malformed_rows} malformed rows in {json_path}")
-        return df.reset_index()
-
+    # pylint: disable=broad-exception-caught
     except builtins.Exception:
         traceback.print_exc()
         return None
@@ -150,7 +79,38 @@ def read_result(config_type: type[ConfigBase], json_path: Path) -> pd.DataFrame:
 
 class Results:
     """
-    Class for processing experiment results.
+    Class for processing experiment results. You can use this class to read the results in an
+    experiment output directory. This can be used in combination with ``PlotAnalysis`` to show the
+    correlation between hyperparameters and metrics. Refer to :ref:`Interpreting Results
+    <interpret_results>` tutorial for more details on plotting and interpreting experiment results.
+
+    Examples
+    --------
+
+    >>> directory_path = Path('<path to experiment output defined in experiment_dir>')
+    >>> results = Results(config = ParallelConfig, experiment_dir=directory_path, use_ray=True)
+    >>> df = results.read_results(config_type=ParallelConfig, experiment_dir=directory_path)
+    
+    Pass ``df`` to ``PlotAnalysis`` to create an analysis object that's able to plot the correlation between
+    the hyperparameters and metrics and save the plots to an output directory. For example, the following
+    code snippet generates plots for each of the numerical and categorical hyperparameters and saves them to
+    ``./plots`` directory. Here "Validation Accuracy" is the name of the main metric.
+
+    >>> analysis = PlotAnalysis(
+    ...         df,
+    ...         save_dir="./plots",
+    ...         cache=True,
+    ...         optim_metrics={"val_accuracy": Optim.max},
+    ...         numerical_attributes=<numerical name remap keys names>,
+    ...         categorical_attributes=<categorical name remap keys names>,
+    ...     )
+    >>> analysis.make_figures(
+    ...     metric_name_remap={
+    ...         "val_accuracy": "Validation Accuracy",
+    ...     },
+    ...     attribute_name_remap= attribute_name_remap
+    ... )
+     
 
     Parameters
     ----------
@@ -185,12 +145,26 @@ class Results:
 
     def __init__(
         self,
-        config: type[ParallelConfig],
+        config: type[ParallelConfig] | ParallelConfig,
         experiment_dir: str | Path,
         cache: bool = False,
         use_ray: bool = False,
     ) -> None:
-        assert issubclass(config, ParallelConfig), "Configuration must be of type. "
+        if not isinstance(config, type):
+            config_type = type(config)
+        else:
+            config_type = config
+        if issubclass(config_type, RunConfig) and not issubclass(
+            config_type, ParallelConfig
+        ):
+            raise ValueError(
+                "Provided a ``RunConfig`` used for a single-trial. Analysis "
+                "is not meaningful for a single trial. Please provide a ``ParallelConfig``."
+            )
+        if not issubclass(config_type, ParallelConfig):
+            raise ValueError(
+                "Configuration must be subclassed from ``ParallelConfig``. "
+            )
         # TODO parse results from experiment directory as opposed to configuration.
         # Need a way to derived MPConfig implementation from a pickled file.
         # We need the types of the configuration, metric map.
@@ -198,7 +172,7 @@ class Results:
         run_config_path = self.experiment_dir.joinpath("default_config.yaml")
         if not run_config_path.exists():
             raise FileNotFoundError(f"{run_config_path}")
-        self.config = config.load(run_config_path)
+        self.config = config_type.load(run_config_path)
         self.metric_map: dict[str, Optim] = self.config.optim_metrics
         self._make_cache(clean=not cache)
         self.data: pd.DataFrame = self._parse_results(
@@ -269,8 +243,10 @@ class Results:
         list[str]
             list of optimize metric names
         """
-        return [str(value) for value in self.metric_map.values()]
+        return [str(v) for v in self.metric_map.values()]
 
+    # method-hidden because we over-write it with the cached version.
+    # pylint: disable=method-hidden
     def _parse_results(
         self,
         experiment_dir: Path,
@@ -297,7 +273,7 @@ class Results:
     def read_results(
         cls,
         config_type: type[ConfigBase],
-        experiment_dir: Path,
+        experiment_dir: Path | str,
         num_cpus=None,
     ) -> pd.DataFrame:
         """
@@ -309,7 +285,7 @@ class Results:
         ----------
         config_type : type[ConfigBase]
             The configuration class
-        experiment_dir : Path
+        experiment_dir : Path | str
             The experiment directory
         num_cpus : int, optional
             Number of CPUs to use for ray processing, by default ``None``
@@ -319,8 +295,9 @@ class Results:
         pd.DataFrame
             A dataframe of all the results
         """
-        results = []
-        json_paths = list(experiment_dir.rglob("results.json"))
+        results: list[pd.DataFrame] = []
+        futures: list[ray.ObjectRef] = []
+        json_paths = list(Path(experiment_dir).rglob("results.json"))
         if len(json_paths) == 0:
             raise RuntimeError(f"No results found in {experiment_dir}")
         cpu_count = mp.cpu_count()
@@ -329,7 +306,7 @@ class Results:
         json_path = None
         for json_path in json_paths:
             if ray.is_initialized():
-                results.append(
+                futures.append(
                     ray.remote(num_cpus=num_cpus)(read_result).remote(
                         config_type, json_path
                     )
@@ -339,6 +316,6 @@ class Results:
         if ray.is_initialized() and len(json_paths) > 0:
             # smoke test
             read_result(config_type, json_path)
-            results = ray.get(results)
+            results = ray.get(futures)
             results = list(filter(lambda x: x is not None, results))
         return pd.concat(results)

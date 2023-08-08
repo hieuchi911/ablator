@@ -8,6 +8,7 @@ import time
 import numpy as np
 import pandas as pd
 import pytest
+import json
 from PIL import Image
 
 from ablator import ModelConfig, OptimizerConfig, RunConfig, TrainConfig
@@ -59,6 +60,7 @@ c = RunConfig(model_config=model_c, train_config=train_c)
 
 def test_summary_logger(tmp_path: Path):
     from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+
     # logpath = tmp_path.joinpath("test.log")
     # logpath.unlink()
     tmp_path = tmp_path.joinpath(f"{random.random()}")
@@ -83,7 +85,7 @@ def test_summary_logger(tmp_path: Path):
     assert_error_msg_fn(
         lambda: SummaryLogger(c2, tmp_path, resume=True),
         lambda msg: msg.startswith(
-            "Different supplied run_config than existing run_config"
+            "Differences between configurations:"
         ),
     )
     l = SummaryLogger(c, tmp_path, resume=True)
@@ -95,7 +97,7 @@ def test_summary_logger(tmp_path: Path):
 
     assert_error_msg(
         lambda: l.checkpoint(save_dict, "b", itr=0),
-        f"Checkpoint iteration 1 > training iteration 0. Can not save checkpoint.",
+        f"Checkpoint iteration 1 >= training iteration 0. Can not overwrite checkpoint.",
     )
     del l.checkpoint_iteration["recent"]["b"]
     assert_error_msg(
@@ -237,8 +239,30 @@ def test_summary_logger(tmp_path: Path):
     assert event_acc.Images("img")[0].encoded_image_string == img_byte_arr
 
 
+def test_results_json(tmp_path: Path):
+    tmp_path = tmp_path.joinpath(f"{random.random()}")
+    l = SummaryLogger(c, tmp_path)
+    for i in range(10):
+        df = pd.DataFrame(np.random.rand(3))
+        l.update({"df": df})
+        results = json.loads(l.result_json_path.read_text())
+        assert (df == pd.DataFrame(results[-1]["df"])).all().all()
+    assert len(results) == 10
+
+    l.update({"test": 5})
+    results = json.loads(l.result_json_path.read_text())
+    assert results[-1]["test"] == 5
+    assert "df" not in results[-1]
+    l.update({"test": "10"})
+    results = json.loads(l.result_json_path.read_text())
+    assert results[-1]["test"] == "10"
+    # breakpoint()
+    # return
+    pass
+
+
 if __name__ == "__main__":
-    # TODO test results.json
+    # test_results_json(Path("/tmp/"))
     test_summary_logger(Path("/tmp/"))
 
     pass

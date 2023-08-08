@@ -33,13 +33,14 @@ class SchedulerArgs(ConfigBase):
         """
         Abstract method to be implemented by derived classes, which creates and returns a scheduler object.
         """
-        raise NotImplementedError("init_optimizer method not implemented.")
+        raise NotImplementedError("init_scheduler method not implemented.")
 
 
 @configclass
 class SchedulerConfig(ConfigBase):
     """
-    Class that defines a configuration for a learning rate scheduler.
+    A class that defines a configuration for a learning rate scheduler. This scheduler config
+    will be provided to ``TrainConfig`` (optional) as part of the training setting of the experiment.
 
     Attributes
     ----------
@@ -48,6 +49,30 @@ class SchedulerConfig(ConfigBase):
     arguments : SchedulerArgs
         The arguments needed to initialize the scheduler.
 
+    Examples
+    --------
+    The following example shows how to create a scheduler config and use it in
+    ``TrainConfig`` to define the training setting of the experiment.
+    
+    >>> optim_config = OptimizerConfig("sgd", {"lr": 0.5})
+    >>> scheduler_config = SchedulerConfig("step", arguments={"step_size": 1, "gamma": 0.99})
+    >>> train_config = TrainConfig(
+    ...     dataset="[Dataset Name]",
+    ...     batch_size=32,
+    ...     epochs=20,
+    ...     optimizer_config=optim_config,
+    ...     scheduler_config=scheduler_config,
+    ...     rand_weights_init = True
+    ... )
+    >>> # ... create running config (proto/parallel), model wrapper, trainer and launch experiment
+
+    .. note::
+        A common use case is to run ablation studies on different schedulers to learn about their
+        effects on the model performance. However, ``SchedulerConfig`` only configures one single
+        scheduler for the experiment. But you can run experiments on different schedulers by creating
+        a custom config class and add an extra method called ``make_scheduler``. Go to this tutorial on
+        :ref:`Search space for different types of optimizers and scheduler <search_space_optim_schedule>`
+        for more details.
     """
 
     name: str
@@ -79,14 +104,14 @@ class SchedulerConfig(ConfigBase):
             _arguments = argument_cls(**arguments)
         super().__init__(name=name, arguments=_arguments)
 
-    def make_scheduler(self, model, optimizer) -> Scheduler:
+    def make_scheduler(self, model: nn.Module, optimizer: Optimizer) -> Scheduler:
         """
         Creates a new scheduler for an optimizer, based on the configuration.
 
         Parameters
         ----------
-        model
-            The model.
+        model: nn.Module
+            Some schedulers require information from the model. The model is passed as an argument.
         optimizer
             The optimizer used to update the model parameters, whose learning rate we want to monitor.
 
@@ -122,8 +147,6 @@ class OneCycleConfig(SchedulerArgs):
 
     max_lr: float
     total_steps: Derived[int]
-    # TODO fix mypy errors for custom types
-    # type: ignore
     step_when: StepType = "train"
 
     def init_scheduler(self, model: nn.Module, optimizer: Optimizer):
@@ -186,8 +209,6 @@ class PlateuaConfig(SchedulerArgs):
     factor: float = 0.0  # TODO {fixme} this is error prone -> new_lr = 0
     threshold: float = 1e-4
     verbose: bool = False
-    # TODO fix mypy errors for custom types
-    # type: ignore
     step_when: StepType = "val"
 
     def init_scheduler(self, model: nn.Module, optimizer: Optimizer):
@@ -239,8 +260,6 @@ class StepLRConfig(SchedulerArgs):
 
     step_size: int = 1
     gamma: float = 0.99
-    # TODO fix mypy errors for custom types
-    # type: ignore
     step_when: StepType = "epoch"
 
     def init_scheduler(self, model: nn.Module, optimizer: Optimizer):

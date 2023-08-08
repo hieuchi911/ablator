@@ -1,24 +1,24 @@
 import copy
 import io
+import typing
 from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
-import typing
 
+import mock
+import numpy as np
 import torch
 from torch import nn
-
 from torch.cuda.amp import GradScaler
+
 from ablator import (
+    Derived,
     ModelConfig,
     ModelWrapper,
     OptimizerConfig,
     RunConfig,
     TrainConfig,
-    Derived,
 )
-from ablator.modules.metrics.main import TrainMetrics
-
-import numpy as np
+from ablator.utils.base import Dummy
 
 optimizer_config = OptimizerConfig(name="sgd", arguments={"lr": 0.1})
 train_config = TrainConfig(
@@ -50,7 +50,7 @@ amp_config = RunConfig(
 class BadMyModel(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
-        self.param = nn.Parameter(torch.ones(100))
+        self.param = nn.Parameter(torch.ones(100, 1))
 
     def forward(self, x: torch.Tensor):
         x = self.param + torch.rand_like(self.param) * 0.01
@@ -60,7 +60,7 @@ class BadMyModel(nn.Module):
 class MyModel(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
-        self.param = nn.Parameter(torch.ones(100))
+        self.param = nn.Parameter(torch.ones(100, 1))
 
     def forward(self, x: torch.Tensor):
         x = self.param + torch.rand_like(self.param) * 0.01
@@ -70,7 +70,7 @@ class MyModel(nn.Module):
 class MyUnstableModel(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
-        self.param = nn.Parameter(torch.ones(100))
+        self.param = nn.Parameter(torch.ones(100, 1))
         self.iteration = 0
 
     def forward(self, x: torch.Tensor):
@@ -85,7 +85,7 @@ class MyUnstableModel(nn.Module):
 class MyWrongCustomModel(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
-        self.param = nn.Parameter(torch.ones(100))
+        self.param = nn.Parameter(torch.ones(100, 1))
         self.iteration = 0
 
     def forward(self, x: torch.Tensor):
@@ -99,7 +99,7 @@ class MyWrongCustomModel(nn.Module):
 class MyCustomModel(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
-        self.param = nn.Parameter(torch.ones(100))
+        self.param = nn.Parameter(torch.ones(100, 1))
         self.iteration = 0
 
     def forward(self, x: torch.Tensor):
@@ -111,6 +111,7 @@ class MyCustomModel(nn.Module):
             return {"preds": x}, None
 
         return {"preds": x}, x.sum().abs() * 1e-7
+
 
 class MyReturnNoneModel(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
@@ -132,7 +133,7 @@ class MyReturnNoneModel(nn.Module):
 class MyBadModel(nn.Module):
     def __init__(self, *args, **kwargs) -> None:
         super().__init__()
-        self.param = nn.Parameter(torch.ones(100))
+        self.param = nn.Parameter(torch.ones(100, 1))
         self.iteration = 0
 
     def forward(self, x: torch.Tensor):
@@ -164,26 +165,23 @@ class DisambigiousTestWrapper(ModelWrapper):
         run_config.model_config.ambigious_var = 10
         return run_config
 
+
 class AuxWrapper(ModelWrapper):
     def make_dataloader_train(self, run_config: RunConfig):
         dl = [torch.rand(100) for i in range(100)]
         return dl
+
     def make_dataloader_val(self, run_config: RunConfig):
         dl = [torch.rand(100) for i in range(100)]
         return dl
-    def aux_metrics(self, output_dict: dict[str, torch.Tensor] | None) -> dict[str, typing.Any] | None:
+
+    def aux_metrics(
+        self, output_dict: dict[str, torch.Tensor] | None
+    ) -> dict[str, typing.Any] | None:
         return {"learning_rate": 0.1}
 
-def assert_error_msg(fn, error_msg):
-    try:
-        fn()
-        assert False, "Should have raised an error."
-    except Exception as excp:
-        if not error_msg == str(excp):
-            raise excp
 
-
-def test_error_models():
+def test_error_models(assert_error_msg):
     assert_error_msg(
         lambda: TestWrapper(BadMyModel).train(config),
         "Model should return outputs: dict[str, torch.Tensor] | None, loss: torch.Tensor | None.",
@@ -217,51 +215,71 @@ def capture_output(fn):
     return out.getvalue(), err.getvalue()
 
 
+class DummyScreen(Dummy):
+    def addstr(self, *args, **kwargs):
+        print(args[2])
+
+    def getmaxyx(self):
+        return 100, 100
+
+
 def test_verbosity():
     verbose_config = RunConfig(
         train_config=train_config,
         model_config=ModelConfig(),
-        verbose="tqdm",
+        verbose="progress",
         metrics_n_batches=100,
         device="cpu",
         amp=False,
     )
-    out, err = capture_output(
-        lambda: TestWrapper(MyCustomModel).train(verbose_config, debug=True)
-    )
 
-    assert err.strip().startswith("0%|          | 0/100") and len(out) == 0
-    verbose_config = RunConfig(
-        train_config=train_config,
-        model_config=ModelConfig(),
-        verbose="tqdm",
-        metrics_n_batches=32,
-        device="cpu",
-        amp=False,
-    )
-    out, err = capture_output(
-        lambda: TestWrapper(MyCustomModel).train(verbose_config, debug=True)
-    )
-    assert (
-        "Metrics batch-limit 32 is smaller than the validation dataloader length 100."
-        in out
-    )
-    console_config = RunConfig(
-        train_config=train_config,
-        model_config=ModelConfig(), 
-        verbose="console",
-        device="cpu",
-        amp=False,
-    )
-    out, err = capture_output(
-        lambda: TestWrapper(MyCustomModel).train(console_config, debug=True)
-    )
-    assert len(err) == 0 and out.endswith("learning_rate: 0.1 total_steps: 200\n")
+    with mock.patch("curses.initscr", DummyScreen), mock.patch(
+        "ablator.utils.progress_bar.Display.close", lambda self: None
+    ):
+        out, err = capture_output(
+            lambda: TestWrapper(MyCustomModel).train(verbose_config, debug=True)
+        )
+        assert (
+            any(
+                [
+                    out.strip().split("\n")[i].endswith("?it/s, Remaining: ??]")
+                    for i in range(5)
+                ]
+            )
+            and len(err) == 0
+        )
+        verbose_config = RunConfig(
+            train_config=train_config,
+            model_config=ModelConfig(),
+            verbose="progress",
+            metrics_n_batches=32,
+            device="cpu",
+            amp=False,
+        )
+        out, err = capture_output(
+            lambda: TestWrapper(MyCustomModel).train(verbose_config, debug=True)
+        )
+        assert (
+            "Metrics batch-limit 32 is larger than 20% of the train dataloader length 100. You might experience slow-down during training. Consider decreasing `metrics_n_batches`."
+            in out
+        )
+        console_config = RunConfig(
+            train_config=train_config,
+            model_config=ModelConfig(),
+            verbose="console",
+            device="cpu",
+            amp=False,
+        )
+        out, err = capture_output(
+            lambda: TestWrapper(MyCustomModel).train(console_config, debug=True)
+        )
+        assert len(err) == 0 and out.endswith(
+            "learning_rate: 0.100000 total_steps: 00000200\n"
+        )
 
 
 def test_train_stats():
-    m = TestWrapper(MyCustomModel).train(config)
-    res = m.to_dict()
+    res = TestWrapper(MyCustomModel).train(config)
     assert res["train_loss"] < 2e-05
     del res["train_loss"]
 
@@ -277,7 +295,7 @@ def test_train_stats():
     }
 
 
-def test_state():
+def test_state(assert_error_msg):
     wrapper = TestWrapper(MyCustomModel)
     assert_error_msg(
         lambda: wrapper.train_stats,
@@ -320,12 +338,12 @@ def test_state():
         "best_loss": float("inf"),
     }
     assert dict(wrapper.train_stats) == train_stats
-    assert wrapper.current_state[
-        "run_config"
-    ] == _config.to_dict() and wrapper.current_state["metrics"] == {
-        **train_stats,
-        **{"train_loss": np.nan, "val_loss": np.nan},
-    }
+    assert (
+        wrapper.current_state["run_config"] == _config.to_dict()
+        and wrapper.current_state["train_metrics"]
+        == {**train_stats, **{"loss": np.nan}}
+        and wrapper.current_state["eval_metrics"] == {"loss": np.nan}
+    )
     assert str(wrapper.model.param.device) == "cpu"
     assert wrapper.model.param.requires_grad == True
     assert wrapper.current_checkpoint is None
@@ -339,7 +357,7 @@ def test_state():
     assert wrapper.random_seed == 100
 
 
-def test_load_save_errors(tmp_path: Path):
+def test_load_save_errors(tmp_path: Path, assert_error_msg):
     tmp_path = tmp_path.joinpath("test_exp")
     wrapper = TestWrapper(MyCustomModel)
 
@@ -347,26 +365,24 @@ def test_load_save_errors(tmp_path: Path):
     _config.verbose = "console"
     _config.experiment_dir = tmp_path
 
-    assert_error_msg(
+    msg = assert_error_msg(
         lambda: [
             wrapper._init_state(run_config=_config),
             wrapper._init_state(run_config=_config),
         ],
-        f"SummaryLogger: Resume is set to False but {tmp_path.joinpath(_config.uid)} exists.",
     )
+    assert msg == f"SummaryLogger: Resume is set to False but {tmp_path} exists."
 
     assert wrapper._init_state(run_config=_config, debug=True) is None
     assert_error_msg(
         lambda: [wrapper._init_state(run_config=_config, resume=True)],
-        f"Could not find a valid checkpoint in {tmp_path.joinpath(_config.uid,'checkpoints')}",
+        f"Could not find a valid checkpoint in {tmp_path.joinpath('checkpoints')}",
     )
 
-    # wrapper =
-    # wrapper.
     pass
 
 
-def test_load_save(tmp_path: Path):
+def test_load_save(tmp_path: Path, assert_error_msg):
     tmp_path = tmp_path.joinpath("test_exp")
     _config = copy.deepcopy(config)
     _config.verbose = "console"
@@ -374,31 +390,34 @@ def test_load_save(tmp_path: Path):
     wrapper = TestWrapper(MyCustomModel)
 
     wrapper.train(_config)
+    old_stats = copy.deepcopy(wrapper.train_stats)
     old_model = copy.deepcopy(wrapper.model)
     wrapper = TestWrapper(MyCustomModel)
 
     wrapper._init_state(run_config=_config, resume=True)
-    wrapper.epochs = 3
-    wrapper._init_state(run_config=_config, resume=True)
-    assert_error_msg(
-        lambda: wrapper.checkpoint(),
-        f"Checkpoint iteration {wrapper.current_iteration} > training iteration {wrapper.current_iteration}. Can not save checkpoint.",
-    )
-    wrapper._inc_iter()
-    wrapper.checkpoint()
-    assert (
-        wrapper.current_state["model"]["param"] == old_model.state_dict()["param"]
-    ).all()
+    assert old_stats == wrapper.train_stats
+    with mock.patch("ablator.ModelWrapper.epochs", return_value=3):
+        wrapper._init_state(run_config=_config, resume=True)
+        wrapper.epochs = 3
+        assert_error_msg(
+            lambda: wrapper.checkpoint(),
+            f"Checkpoint iteration {wrapper.current_iteration} >= training iteration {wrapper.current_iteration}. Can not overwrite checkpoint.",
+        )
+        wrapper._inc_iter()
+        wrapper.checkpoint()
+        assert (
+            wrapper.current_state["model"]["param"] == old_model.state_dict()["param"]
+        ).all()
 
 
-def test_train_loop():
+def test_train_loop(assert_error_msg):
     _config = copy.deepcopy(config)
 
     wrapper = TestWrapper(MyReturnNoneModel)
     wrapper._init_state(run_config=_config)
     assert_error_msg(
         lambda: wrapper.train_loop(),
-        "Model should return outputs: dict[str, torch.Tensor] | None, loss: torch.Tensor | None."
+        "Model should return outputs: dict[str, torch.Tensor] | None, loss: torch.Tensor | None.",
     )
 
 
@@ -407,32 +426,45 @@ def test_validation_loop():
     _config = copy.deepcopy(config)
     wrapper._init_state(_config)
     val_dataloder = wrapper.make_dataloader_val(_config)
-    metrics_dict = wrapper.validation_loop(MyBadModel(_config), val_dataloder, wrapper.metrics, 'val')
-    assert len(metrics_dict) == 1 and "val_loss" in metrics_dict.keys()
+    metrics_dict = wrapper.validation_loop(
+        MyBadModel(_config),
+        val_dataloder,
+        wrapper.eval_metrics,
+    )
+    assert len(metrics_dict) == 1 and "loss" in metrics_dict.keys()
 
 
-def test_train_resume(tmp_path: Path):
+def test_train_resume(tmp_path: Path, assert_error_msg):
     tmp_path = tmp_path.joinpath("test_exp")
     _config = copy.deepcopy(config)
     _config.verbose = "console"
     _config.experiment_dir = tmp_path
     wrapper = TestWrapper(MyCustomModel)
 
-    assert_error_msg(
+    msg = assert_error_msg(
         lambda: [wrapper.train(_config, resume=True)],
-        f"Could not find a valid checkpoint in {tmp_path.joinpath(_config.uid,'checkpoints')}",
+    )
+    assert (
+        msg
+        == f"Could not find a valid checkpoint in {wrapper.experiment_dir.joinpath('checkpoints')}"
     )
 
 
 if __name__ == "__main__":
-    # import shutil
+    import shutil
+    from tests.conftest import _assert_error_msg
+
     tmp_path = Path("/tmp/")
-    # shutil.rmtree(tmp_path.joinpath("test_exp"), ignore_errors=True)
-    # test_load_save(tmp_path)
-    test_error_models()
-    # test_train_stats()
-    # test_state()
+
+    shutil.rmtree(tmp_path.joinpath("test_exp"), ignore_errors=True)
+    test_load_save(tmp_path, _assert_error_msg)
+    shutil.rmtree(tmp_path.joinpath("test_exp"), ignore_errors=True)
+    test_load_save_errors(tmp_path, _assert_error_msg)
+    test_error_models(_assert_error_msg)
+    test_train_stats()
+    test_state(_assert_error_msg)
+
     test_verbosity()
-    test_train_resume(tmp_path)
-    test_train_loop()
+    test_train_resume(tmp_path, _assert_error_msg)
+    test_train_loop(_assert_error_msg)
     test_validation_loop()

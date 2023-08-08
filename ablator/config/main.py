@@ -51,10 +51,23 @@ class Missing:
 @dataclass(repr=False)
 class ConfigBase:
     # NOTE: this allows for non-defined arguments to be created. It is very bug-prone and will be disabled.
-    """Base class for configuration objects.
+    """
 
-    First, it checks if there are any unannotated variables inside the child config class. If there are,
-    it will raise an assert error.
+    This class this the building block for all configuration objects within ablator. It serves as the base class for
+    configurations such as ``ModelConfig``, ``TrainConfig``, ``OptimizerConfig``, and more.
+
+    To customize configurations for specific needs, you can create your own configuration class by inheriting from ``ConfigBase``.
+    It's essential to annotate it with ``@configclass``. For instance, in the tutorial :ref:`Search space for different types
+    of optimizers and scheduler <search_space_optim_schedule>`, a custom optimizer config class is created to enable ablation study on various optimizers
+    and schedulers. You can refer to this tutorial for an example of how to create your custom configuration class.
+
+    Examples
+    --------
+
+    >>> @configclass
+    >>> class MyCustomConfig(ConfigBase):
+    ...     attr1: int = 1
+    ...     attr2: Tuple[str, int, str]
 
     Parameters
     ----------
@@ -75,9 +88,9 @@ class ConfigBase:
     KeyError
         If unexpected arguments are provided.
 
-    Notes
-    -----
-    All config class must be decorated with ``@configclass``
+    .. note::
+       All config class must be decorated with ``@configclass``
+
     """
     config_class = type(None)
 
@@ -190,7 +203,7 @@ class ConfigBase:
             annotation_types.update(dataclass_types)
 
             annotations = {
-                field_name: parse_type_hint(annotation)
+                field_name: parse_type_hint(type(self), annotation)
                 for field_name, annotation in annotation_types.items()
             }
         return annotations
@@ -247,11 +260,12 @@ class ConfigBase:
         annot: dict[str, Annotation] = self.get_val_with_dot_path(annot_dot_path)
         return annot[element].variable_type
 
+    # pylint: disable=too-complex
     def make_dict(
         self,
         annotations: dict[str, Annotation],
-        ignore_stateless=False,
-        flatten=False,
+        ignore_stateless: bool = False,
+        flatten: bool = False,
     ):
         """
         Create a dictionary representation of the configuration object.
@@ -276,7 +290,11 @@ class ConfigBase:
             if issubclass(type(val), Type):
                 return val.__dict__
             if issubclass(type(val), ConfigBase):
-                return val.make_dict(val.annotations)
+                # TODO test-case for
+                # val.make_dict(val.annotations) vs below
+                return val.make_dict(
+                    val.annotations, ignore_stateless=ignore_stateless, flatten=flatten
+                )
 
             return val
 
@@ -357,7 +375,6 @@ class ConfigBase:
         diffs = sorted(self.diff_str(config, ignore_stateless=True))
         diff = "\n\t".join(diffs)
         assert len(diffs) == 0, f"Differences between configurations:\n\t{diff}"
-        self.assert_unambigious()
         return True
 
     def merge(self, config: "ConfigBase") -> "ty.Self":  # type: ignore
@@ -395,7 +412,7 @@ class ConfigBase:
 
         return left_config
 
-    def diff_str(self, config: "ConfigBase", ignore_stateless=False):
+    def diff_str(self, config: "ConfigBase", ignore_stateless: bool = False):
         """
         Get the differences between the current configuration object and another configuration object as strings.
 
@@ -420,7 +437,7 @@ class ConfigBase:
         return str_diffs
 
     def diff(
-        self, config: "ConfigBase", ignore_stateless=False
+        self, config: "ConfigBase", ignore_stateless: bool = False
     ) -> list[tuple[str, tuple[type, ty.Any], tuple[type, ty.Any]]]:
         """
         Get the differences between the current configuration object and another configuration object.
@@ -492,7 +509,7 @@ class ConfigBase:
                 diffs.append((k, (left_type, left_v), (right_type, right_v)))
         return diffs
 
-    def to_dict(self, ignore_stateless=False):
+    def to_dict(self, ignore_stateless: bool = False):
         """
         Convert the configuration object to a dictionary.
 
@@ -521,7 +538,7 @@ class ConfigBase:
         """
         return str(self)
 
-    def to_dot_path(self, ignore_stateless=False):
+    def to_dot_path(self, ignore_stateless: bool = False):
         """
         Convert the configuration object to a dictionary with dot notation paths as keys.
 
@@ -587,8 +604,10 @@ class ConfigBase:
                 and getattr(self, k) is not None
             ):
                 if annot.collection in [List, Tuple]:
-                    [_lval.assert_unambigious() for _lval in getattr(self, k)]
+                    for _lval in getattr(self, k):
+                        _lval.assert_unambigious()
                 elif annot.collection in [Dict]:
-                    [_lval.assert_unambigious() for _lval in getattr(self, k).values()]
+                    for _lval in getattr(self, k).values():
+                        _lval.assert_unambigious()
                 else:
                     getattr(self, k).assert_unambigious()

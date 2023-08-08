@@ -218,7 +218,7 @@ single-line-if-stmt=no
 single-line-class-stmt=no
 
 # Maximum number of lines in a module
-max-module-lines=1000
+max-module-lines=2000
 
 # String used as indentation unit. This is usually "    " (4 spaces) or "\t" (1
 # tab).
@@ -515,7 +515,7 @@ preferred-modules=
 
 # Exceptions that will emit a warning when being caught. Defaults to
 # "Exception"
-overgeneral-exceptions=Exception
+overgeneral-exceptions=builtins.Exception
 
 
 [TYPING]
@@ -526,7 +526,7 @@ overgeneral-exceptions=Exception
 # For libraries, evaluate if some users what to access the type hints at
 # runtime first, e.g., through ``typing.get_type_hints``. Applies to Python
 # versions 3.7 - 3.9
-runtime-typing = no
+runtime-typing = true
 
 
 [DEPRECATED_BUILTINS]

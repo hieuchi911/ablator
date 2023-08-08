@@ -1,4 +1,6 @@
 from pathlib import Path
+
+import pytest
 from ablator.modules.storage.remote import RemoteConfig
 import os
 import getpass
@@ -28,7 +30,7 @@ def load_rand_tensors(tmp_path: Path, n=2):
 def assert_tensor_list_eq(a, b):
     assert all([all(_a == _b) for _a, _b in zip(a, b)])
 
-@pytest.mark.skipif(sys.platform == 'win32', reason="Rysnc does not support by Windows")
+@pytest.mark.skip("Remote Config is obsolete")
 def test_remote(tmp_path: Path):
     username = getpass.getuser()
     hostname = "localhost"

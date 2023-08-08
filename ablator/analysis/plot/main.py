@@ -12,14 +12,55 @@ from ablator.analysis.main import Analysis
 from ablator.analysis.plot import Plot
 from ablator.analysis.plot.cat_plot import ViolinPlot
 from ablator.analysis.plot.num_plot import LinearPlot
-from ablator.main.configs import Optim
+from ablator.config.mp import Optim
 
 logger = logging.getLogger(__name__)
 
 
 class PlotAnalysis(Analysis):
     """
-    Class for analyzing plotting
+    Class for plotting experiment results. You can use this class and ``Results`` class to visualize the
+    relationship between any hyperparameter that you run ablation study on with the result metrics. This
+    valuable insight offers an intuitive understanding of how these parameters may influence your
+    model's performance.
+
+    Plots supported are linear plots for numerical data and violin plots for categorical data.
+
+    Examples
+    --------
+    - Data frame to be used:
+
+    >>> df2 = pd.DataFrame({'val_accuracy': np.random.uniform(0.8,0.9,10),
+    ...       'train_config.optimizer_config.arguments.lr': np.random.uniform(0.001, 0.1,10),
+    ...       "index": range(10),
+    ...       "path": range(10)})
+
+    - Creating dictionaries that map the configuration parameters [categorical + numerical] to custom labels for plots:
+
+    >>> numerical_name_remap = {
+    ...             "train_config.optimizer_config.arguments.lr": "Learning Rate",
+    ...         }
+    ...     categorical_name_remap = {}
+    ...     attribute_name_remap = {**categorical_name_remap, **numerical_name_remap}
+
+    - Initalize the ``PlotAnalysis`` and plot the figures:
+
+    >>> analysis = PlotAnalysis(
+    ...     df,
+    ...     save_dir="./plots",
+    ...     cache=True,
+    ...     optim_metrics={"val_accuracy": Optim.max},
+    ...     numerical_attributes=list(numerical_name_remap.keys()),
+    ...     categorical_attributes=list(categorical_name_remap.keys()),
+    ... )
+    >>> analysis.make_figures(
+    ...    metric_name_remap={
+    ...        "val_accuracy": "Validation Accuracy",
+    ...    },
+    ...    attribute_name_remap= attribute_name_remap
+    ... )
+
+    The directory ``"plots"`` contains all the plots of the HPO experiments
     """
 
     @classmethod
@@ -67,8 +108,8 @@ class PlotAnalysis(Analysis):
         metric_map: dict[str, Optim],
         append=False,
         ax: Axes | None = None,
-        metric_name_remap=None,
-        attribute_name_remap=None,
+        metric_name_remap: dict[str, str] | None = None,
+        attribute_name_remap: dict[str, str] | None = None,
         **kwargs,
     ):
         """
@@ -90,10 +131,10 @@ class PlotAnalysis(Analysis):
             A boolean indicating whether to append plots to an existing axes object.
         ax: Axes | None
             A matplotlib.axes.Axes object representing the axis to plot on.
-        metric_name_remap: dict
-            A dictionary mapping metric names to new metric names.
-        attribute_name_remap: dict
-            A dictionary mapping attribute names to new attribute names.
+        metric_name_remap: dict[str, str] | None
+            An optional dictionary mapping metric names to new metric names.
+        attribute_name_remap: dict[str, str] | None
+            An optional dictionary mapping attribute names to new attribute names.
         kwargs: Additional keyword arguments to pass to the plot method.
 
         Examples

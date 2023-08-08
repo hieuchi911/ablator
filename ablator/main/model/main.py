@@ -9,17 +9,18 @@ from collections.abc import Callable
 from functools import cached_property
 from pathlib import Path
 
+from filelock import FileLock
 import setproctitle
 import torch
 from torch import nn
 from torch.utils.data import DataLoader
-from tqdm import tqdm
 
 import ablator.utils.base as butils
-from ablator.main.configs import RunConfig
+from ablator.config.proto import RunConfig
 from ablator.modules.loggers.main import SummaryLogger
-from ablator.modules.metrics.main import TrainMetrics
+from ablator.modules.metrics.main import Metrics
 from ablator.utils.base import Dummy
+from ablator.utils.progress_bar import ProgressBar, RemoteProgressBar
 
 
 class EvaluationError(Exception):
@@ -38,6 +39,7 @@ class CheckpointNotFoundError(FileNotFoundError):
     pass
 
 
+# pylint: disable=too-many-instance-attributes
 class ModelBase(ABC):
     """
     Base class that removes training boiler-plate code with extensible support
@@ -57,7 +59,7 @@ class ModelBase(ABC):
         An optional DataLoader object used for model evaluation.
     test_dataloader : Optional[DataLoader]
         An optional DataLoader object used for model testing.
-    logger : Union[SummaryLogger, tutils.Dummy]
+    logger : Union[SummaryLogger, Dummy]
         Records information on the program's operation and model training, such as progress and performance metrics.
     device : str
         The type of device used for running the experiment. i.e. ``"cuda"``, ``"cpu"``, ``"cuda:0"``.
@@ -74,13 +76,15 @@ class ModelBase(ABC):
         If ``True``, apply automatic mixed precision training, otherwise default precision.
     random_seed : Optional[int]
         Sets the seed for generating random numbers.
-    train_tqdm : tqdm, optional
-        An optional instance of ``tqdm`` that creates progress bars and displays real-time information during training.
-        i.e. time remaining. Only applied for the master process.
+    progress_bar : Union[ProgressBar, Dummy]
+        An optional instance of ``ProgressBar`` that displays real-time information during training.
+        e.g. time remaining. Only applied for the master process.
     current_checkpoint : Optional[Path]
         Directory for the current checkpoint file, by default None.
-    metrics : Metrics
+    train_metrics : Metrics
         Training metrics including model information. i.e. learning rate and loss value.
+    eval_metrics : Metrics | None
+        Evaluation metrics for when a ``val_dataloader`` is provided.
     current_state : dict
         The currrent state of the model, including run_config, metrics and other necessary states.
     learning_rate : float
@@ -102,10 +106,11 @@ class ModelBase(ABC):
 
     2. Users must implement the abstract methods to customize the model's behavior.
 
-    3. Mixed precision training enables some operations to use the ``torch.float32`` datatype and other operations use lower
-    precision floating point datatype ``torch.float16``. This is for saving time and reducing memory usage. Ordinarily,
-    "automatic mixed precision training" means training with ``torch.autocast`` and ``torch.cuda.amp.GradScaler`` together.
-    More information: https://pytorch.org/docs/stable/amp.html
+    3. Mixed precision training enables some operations to use the ``torch.float32`` datatype and
+       other operations use lower precision floating point datatype ``torch.float16``. This is for saving time and reducing memory usage. Ordinarily,
+       "automatic mixed precision training" means training with ``torch.autocast`` and
+       ``torch.cuda.amp.GradScaler`` together.
+       More information: https://pytorch.org/docs/stable/amp.html
 
     """
 
@@ -128,17 +133,17 @@ class ModelBase(ABC):
         self.test_dataloader: DataLoader | None = None
         self.logger: ty.Union[SummaryLogger, Dummy]
         self.device: str
-        self.model_dir: Path | None = None
         self.experiment_dir: Path | None = None
         self.autocast: torch.autocast
-        self.verbose: ty.Literal["tqdm", "console", "silent"]
+        self.verbose: ty.Literal["progress", "console", "silent"]
         self.amp: bool
         self.random_seed: ty.Optional[int]
-        self.train_tqdm: tqdm = None
+        self.progress_bar: ProgressBar | butils.Dummy
 
         self.current_checkpoint: Path | None = None
         # Runtime metrics
-        self.metrics: TrainMetrics
+        self.train_metrics: Metrics
+        self.eval_metrics: Metrics | None = None
         self.current_state: dict = {}
 
         # stats
@@ -148,6 +153,10 @@ class ModelBase(ABC):
         self.current_iteration = 0
         self.best_iteration = 0
         self.best_loss = float("inf")
+
+        # internal properties
+        self._uid: str
+        self._epochs: int
 
     @property
     def train_stats(self) -> OrderedDict:
@@ -252,24 +261,7 @@ class ModelBase(ABC):
         str
             A string representing the unique identifier of the current run configuration.
         """
-        return self.run_config.uid
-
-    def _get_process_name(self) -> str:
-        """
-        Retrieves the process name based on the model directory, experiment directory, or UID.
-
-        Returns
-        -------
-        str
-            The process name for the current instance.
-        """
-        if self.model_dir is not None and self.experiment_dir is not None:
-            proc_title = self.model_dir.relative_to(
-                self.experiment_dir.parent
-            ).as_posix()
-        else:
-            proc_title = self.uid
-        return proc_title
+        return getattr(self, "_uid", self.run_config.uid)
 
     @abstractmethod
     def create_model(
@@ -386,19 +378,21 @@ class ModelBase(ABC):
         resume : bool, optional
             If True, the logger will resume logging from a previous experiment, by default False.
         debug : bool, optional
-            If True, logger will log additional debug information, by default False.
+            If True, no artifacts will be saved by the ``SummaryLogger``, by default False.
         """
         self.logger = SummaryLogger(
             run_config=self.run_config,
-            model_dir=self.model_dir,
+            experiment_dir=self.experiment_dir if not debug else None,
             resume=resume,
             keep_n_checkpoints=self.run_config.keep_n_checkpoints,
             verbose=self.run_config.verbose == "console",
         )
         if butils.debugger_is_active() and not debug:
-            self.logger.warn("Debug flag is False but running in debug mode.")
-
-        self.logger.info(f"Model directory: {self.model_dir}")
+            self.logger.warn("Debug flag is False but running debugger.")
+        elif debug:
+            self.logger.warn("Debug flag is True, will not save any checkpoints.")
+        if self.experiment_dir is not None:
+            self.logger.info(f"Model directory: {self.experiment_dir}")
 
     def _make_dataloaders(self, run_config: RunConfig):
         """
@@ -413,9 +407,9 @@ class ModelBase(ABC):
         assert (
             len(self.train_dataloader) > 0
         ), "Must define a train dataloader in `make_dataloader`"
-        self.epochs = self.run_config.train_config.epochs
+        self._epochs = self.run_config.train_config.epochs
 
-    def _init_class_attributes(self, debug=False):
+    def _init_class_attributes(self):
         """
         Initializes the class attributes based on the provided configuration.
 
@@ -423,20 +417,25 @@ class ModelBase(ABC):
         warnings handling, early stopping, metrics, experiment and model directories, and
         process title.
 
-        Parameters
-        ----------
-        debug : bool, optional
-            If True, disables the experiment and model directories creation, by default False.
         """
         run_config = self.run_config
         self.device = butils.parse_device(run_config.device)
 
         self.amp = run_config.amp
         if self.device == "cpu" and self.amp:
-            raise ValueError(
-                "AMP is not supported for CPU. You will need to set `run_config.amp` to False."
+            self.logger.warn(
+                "Automatic Mixed Precision (AMP) is not supported for CPU. Setting `amp` to False."
             )
+            self.amp = False
 
+        if (batch_lim := run_config.metrics_n_batches) > len(
+            self.train_dataloader
+        ) * 0.2:
+            self.logger.warn(
+                f"Metrics batch-limit {batch_lim} is larger than "
+                f"20% of the train dataloader length {len(self.train_dataloader)}. "
+                "You might experience slow-down during training. Consider decreasing `metrics_n_batches`."
+            )
         self.autocast = torch.autocast(
             enabled=self.amp,
             device_type="cuda" if "cuda" in self.device else "cpu",
@@ -455,23 +454,23 @@ class ModelBase(ABC):
                 self.val_dataloader is not None
             ), "dataloader function has to return validation set when setting early stopping to True"
 
-        self.metrics = TrainMetrics(
+        self.train_metrics = Metrics(
             batch_limit=run_config.metrics_n_batches,
             memory_limit=int(run_config.metrics_mb_limit * 1e6),
             moving_average_limit=self.epoch_len,
             evaluation_functions=self.evaluation_functions(),
-            tags=["train"] + (["val"] if self.val_dataloader is not None else []),
             static_aux_metrics=self.train_stats,
-            moving_aux_metrics=["loss"] + getattr(self, "aux_metric_names", []),
+            moving_aux_metrics=["loss"],
         )
-        if self.run_config.experiment_dir is not None and not debug:
-            self.experiment_dir = Path(self.run_config.experiment_dir)
-            self.model_dir = self.experiment_dir.joinpath(self.uid)
-
-        if debug and (self.experiment_dir is not None or self.model_dir is not None):
-            self.experiment_dir = self.model_dir = None
-
-        setproctitle.setproctitle(self._get_process_name())
+        if self.val_dataloader is not None:
+            self.eval_metrics = Metrics(
+                batch_limit=None,
+                memory_limit=int(run_config.metrics_mb_limit * 1e6),
+                moving_average_limit=self.epoch_len,
+                evaluation_functions=self.evaluation_functions(),
+                moving_aux_metrics=["loss"],
+            )
+        setproctitle.setproctitle(self.uid)
 
     def _init_model_state(self, resume: bool = False, smoke_test: bool = False):
         """
@@ -484,11 +483,8 @@ class ModelBase(ABC):
         smoke_test : bool, optional
             Whether to run as a smoke test, by default False.
         """
-        if self.run_config.init_chkpt is not None and resume:
-            self.current_checkpoint = Path(self.run_config.init_chkpt)
-            self._load_model(self.current_checkpoint, model_only=False)
 
-        elif self.run_config.init_chkpt is not None and not resume:
+        if self.run_config.init_chkpt is not None and not resume:
             # Loads only the weights
             self.current_checkpoint = Path(self.run_config.init_chkpt)
             self.logger.info(
@@ -505,7 +501,8 @@ class ModelBase(ABC):
             self._find_load_valid_checkpoint(recent_checkpoint_dir)
         else:
             self.current_checkpoint = None
-            self.logger.info("Creating new model")
+            if not smoke_test:
+                self.logger.info("Creating new model")
             self.create_model()
             self._update_save_dict()
 
@@ -515,6 +512,7 @@ class ModelBase(ABC):
         smoke_test: bool = False,
         debug: bool = False,
         resume: bool = False,
+        remote_progress_bar: ty.Optional[RemoteProgressBar] = None,
     ):
         """
         Initializes the state of the trainer based on provided configuration and parameters.
@@ -529,6 +527,8 @@ class ModelBase(ABC):
             If True, disables logging and model directory creation, by default False.
         resume : bool, optional
             If True, tries to resume training from a checkpoint, by default False.
+        remote_progress_bar: RemoteProgressBar, optional
+            A remote progress bar can be used to report metrics from the internal progress bar
         """
         self.run_config = run_config
         self.random_seed = self.run_config.random_seed
@@ -536,28 +536,44 @@ class ModelBase(ABC):
             butils.set_seed(self.random_seed)
         self.run_config = run_config
         _run_config = copy.deepcopy(run_config)
-        self._make_dataloaders(self.run_config)
+        # TODO unit test
+        with FileLock(Path.home().joinpath(".data-lock-abtorch")):
+            self._make_dataloaders(self.run_config)
 
         self.run_config = self.config_parser(run_config)
-        self._init_class_attributes(debug=debug)
+
+        if self.run_config.experiment_dir is not None:
+            self.experiment_dir = (
+                Path(self.run_config.experiment_dir).resolve().absolute()
+            )
+            self.run_config.experiment_dir = self.experiment_dir.as_posix()
+
         # Does not create log artifacts during smoke test
         if not smoke_test:
             self._init_logger(resume=resume, debug=debug)
         else:
             self.logger = butils.Dummy()
-        self._init_model_state(resume, smoke_test)
-        self.run_config.assert_state(_run_config)
 
-        if self.verbose == "tqdm" and not smoke_test:
-            self.train_tqdm = tqdm(
-                total=self.epoch_len,
-                bar_format="{l_bar}{bar:10}{r_bar}{bar:-10b}",
-                position=0,
-                leave=True,
-                dynamic_ncols=True,
+        self._init_class_attributes()
+        if debug and self.experiment_dir is not None:
+            self.logger.warn(
+                f"Experiment Directory specified {self.experiment_dir} while running on debug mode. "
+                "You can disable the file system by setting `run_config.experiment_dir=False`. "
+            )
+        self._init_model_state(resume, smoke_test or debug)
+        self.run_config.assert_state(_run_config)
+        self.run_config.assert_unambigious()
+        # TODO freeze config here
+        if self.verbose == "progress" and not smoke_test:
+            self.progress_bar = ProgressBar(
+                epoch_len=self.epoch_len,
+                total_steps=self.total_steps,
+                logfile=self.logger.log_file_path,
+                remote_display=remote_progress_bar,
+                uid=self.uid,
             )
         else:
-            self.train_tqdm = butils.Dummy()
+            self.progress_bar = butils.Dummy()
 
     def _find_load_valid_checkpoint(self, chkpt_dir):
         """
@@ -585,6 +601,7 @@ class ModelBase(ABC):
                     self._load_model(_checkpoint, model_only=False)
                     current_checkpoint = _checkpoint
                     break
+                # pylint: disable=broad-exception-caught
                 except Exception as e:
                     if i == len(latest_checkpoints) - 1:
                         # if it is the last checkpoint raise exception
@@ -595,7 +612,9 @@ class ModelBase(ABC):
                         f"Error loading checkpoint {_checkpoint}. Trying another....\n{traceback.format_exc()}"
                     )
         if current_checkpoint is None:
-            raise CheckpointNotFoundError(f"Could not find a valid checkpoint in {chkpt_dir}")
+            raise CheckpointNotFoundError(
+                f"Could not find a valid checkpoint in {chkpt_dir}"
+            )
         self.current_checkpoint = current_checkpoint
 
     def _load_model(self, checkpoint_path: Path, model_only: bool = False) -> None:
@@ -613,18 +632,32 @@ class ModelBase(ABC):
         ------
         NotImplementedError
             If the model's run configuration is not initialized before attempting to load the model.
+        RuntimeError
+            If no valid checkpoint was found, such as invalid path, and when `model_only=True` we check
+            for differences between loaded and current configuration.
         """
 
         if not hasattr(self, "run_config") or self.run_config is None:
             raise NotImplementedError(
                 "Can not load model on an unitialzed model state. Consider run init_experiment_state function first"
             )
-
-        save_dict = torch.load(checkpoint_path, map_location="cpu")
-
+        try:
+            save_dict = torch.load(checkpoint_path, map_location="cpu")
+        except Exception as e:
+            raise RuntimeError(
+                f"{checkpoint_path} is not a valid checkpoint e.g. a `.pt` file. "
+            ) from e
+        if model_only:
+            self.load_checkpoint(save_dict, model_only=model_only)
+            return
         run_config = type(self.run_config)(**save_dict["run_config"])
-        assert run_config.uid == self.run_config.uid
-
+        if run_config.uid != self.run_config.uid:
+            diffs = "\n\t".join(
+                run_config.diff_str(self.run_config, ignore_stateless=True)
+            )
+            raise RuntimeError(
+                f"Mismatching loaded and current configurations. \n{diffs}"
+            )
         self._load_stats(save_dict)
         self.load_checkpoint(save_dict, model_only=model_only)
         self.current_state = save_dict
@@ -690,7 +723,7 @@ class ModelBase(ABC):
         save_dict : dict
             A dictionary containing the saved model state, metrics, and other necessary information.
         """
-        metrics = copy.deepcopy(save_dict["metrics"])
+        metrics = copy.deepcopy(save_dict["train_metrics"])
 
         for k in self.train_stats:
             if (
@@ -709,14 +742,12 @@ class ModelBase(ABC):
                 setattr(self, k, metrics[k])
                 del metrics[k]
 
-        self.metrics.update_static_metrics(self.train_stats)
-        tags = {m.split("_")[0] for m in metrics}
-        metric_names = {m.split("_")[1] for m in metrics}
+        self.train_metrics.update_static_metrics(self.train_stats)
+        self.train_metrics.update_ma_metrics(metrics)
 
-        for tag in tags:
-            self.metrics.update_ma_metrics(
-                {m: metrics[f"{tag}_{m}"] for m in metric_names}, tag=tag
-            )
+        if "eval_metrics" in save_dict and self.eval_metrics is not None:
+            metrics = copy.deepcopy(save_dict["eval_metrics"])
+            self.eval_metrics.update_ma_metrics(metrics)
 
     def _update_save_dict(self, user_save_dict: dict[str, ty.Any] | None = None):
         """
@@ -730,8 +761,10 @@ class ModelBase(ABC):
         """
         self.current_state = {
             "run_config": self.run_config.to_dict(),
-            "metrics": self.metrics.to_dict(),
+            "train_metrics": self.train_metrics.to_dict(),
         }
+        if self.eval_metrics is not None:
+            self.current_state["eval_metrics"] = self.eval_metrics.to_dict()
         if user_save_dict is not None:
             self.current_state.update(**user_save_dict)
 

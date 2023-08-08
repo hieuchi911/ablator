@@ -1,5 +1,6 @@
 import copy
 import multiprocessing as mp
+import time
 import traceback
 import typing as ty
 from abc import abstractmethod
@@ -13,17 +14,22 @@ from torch.optim import Optimizer
 from torch.utils.data import DataLoader
 
 import ablator.utils.base as butils
-from ablator.main.configs import ModelConfig, RunConfig, TrainConfig
+from ablator.config.proto import ModelConfig, RunConfig, TrainConfig
 from ablator.main.model.main import EvaluationError, ModelBase, TrainPlateauError
-from ablator.modules.metrics.main import LossDivergedError, TrainMetrics
+from ablator.modules.metrics.main import LossDivergedError, Metrics
 from ablator.modules.optimizer import OptimizerConfig
 from ablator.modules.scheduler import Scheduler, SchedulerConfig
+from ablator.utils.progress_bar import RemoteProgressBar
 
 
+# pylint: disable=too-many-public-methods
+# pylint: disable=too-many-instance-attributes
 class ModelWrapper(ModelBase):
     """
-    A wrapper around model_class that removes training boiler-plate code, with over-writable functions
-    with support for custom use-cases.
+    A wrapper around ``model_class`` that removes training boiler-plate code. Its functions are over-writable
+    to support for custom use-cases. Once ``make_dataloader_train`` is overriden to provide a training dataset,
+    ``ModelWrapper`` object will be passed to the trainers (``ProtoTrainer`` or ``ParallelTrainer``) along with running
+    configuration to launch the experiment.
 
     Attributes
     ----------
@@ -59,6 +65,7 @@ class ModelWrapper(ModelBase):
         self.optimizer: Optimizer
         self.scaler: GradScaler
         self.scheduler: Scheduler | None
+        self._prev_update_time: float = time.time()
 
     @property
     def train_config(self) -> TrainConfig:
@@ -74,12 +81,15 @@ class ModelWrapper(ModelBase):
         strict_load: bool = True,
     ) -> None:
         """
-        Creates the model, optimizer, scheduler and scaler from the save dict or from config.
+        Creates the model, optimizer, scheduler, and scaler from a saved checkpoint dictionary or from config. You can overwrite this
+        function and ``save_dict()`` function to customize the saving and loading of the model, optimizer, and scheduler to
+        your needs. An example for this is shown in :ref:`Saving and loading multi-module models <multi_module_models>`
+        tutorial.
 
         Parameters
         ----------
         save_dict: dict[str, ty.Any]
-            The save dict to load from.
+            The saved checkpoint dictionary to load from.
         strict_load: bool
             Whether to load the model strictly or not.
         """
@@ -340,35 +350,42 @@ class ModelWrapper(ModelBase):
     def _train_evaluation_step(self, smoke_test=False):
         is_best = False
         val_loss = None
+        # If we are within 10% of the start or end of an epoch, we skip
+        # evalaution of train metrics for faster training
+        if (
+            self.current_iteration % self.epoch_len > 0.1 * self.epoch_len
+            and self.current_iteration % self.epoch_len < 0.9 * self.epoch_len
+        ):
+            self.train_metrics.evaluate(reset=False)
+
         if self.val_dataloader is not None:
             metrics = self._validation_loop(
                 model=self.model,
                 dataloader=self.val_dataloader,
-                tag="val",
-                metrics=self.metrics,
+                metrics=self.eval_metrics,
                 subsample=self.run_config.eval_subsample,
                 smoke_test=smoke_test,
             )
-            val_loss = metrics["val_loss"] if "val_loss" in metrics else None
+            val_loss = metrics["loss"] if "loss" in metrics else None
         if val_loss is not None:
             # Use val loss for scheduling or finding best checkpoint
 
-            is_best = val_loss < self.best_loss
-
-            if is_best or self.best_loss == 0:
+            if is_best := val_loss < self.best_loss:
                 self.best_iteration = self.current_iteration
                 self.best_loss = val_loss
 
             divergence_step = (
                 self.current_iteration > self.epoch_len * self.run_config.warm_up_epochs
             )
-            is_diverged = val_loss / self.best_loss > self.run_config.divergence_factor
+            is_diverged = self.run_config.divergence_factor is not None and (
+                val_loss / (self.best_loss + 1e-5) > self.run_config.divergence_factor
+            )
 
             if is_diverged and divergence_step:
                 raise LossDivergedError(
-                    f"Val loss {val_loss:.4e} has diverged by"
-                    f"a factor of {self.run_config.divergence_factor} to "
-                    f"best loss {self.best_loss:.4e}"
+                    f"Val loss {val_loss:.2e} has diverged by "
+                    f"a factor larger than {self.run_config.divergence_factor} to "
+                    f"best loss {self.best_loss:.2e}"
                 )
 
         if (
@@ -378,10 +395,11 @@ class ModelWrapper(ModelBase):
         ):
             if val_loss is None:
                 raise EvaluationError(
-                    f"A validation dataset is rquired with {self.scheduler.__class__.__name__} scheduler"
+                    f"A validation dataset is required with {self.scheduler.__class__.__name__} scheduler"
                 )
             self.scheduler.step(val_loss)
 
+        self.update_status()
         self._checkpoint()
         if is_best:
             self._checkpoint(is_best=True)
@@ -445,9 +463,6 @@ class ModelWrapper(ModelBase):
         outputs, loss = self._model_step(model=model, batch=batch)
 
         loss_value = self.apply_loss(model, loss, optimizer, scaler, scheduler)
-        aux_metrics = None
-        if outputs is not None:
-            aux_metrics = self.aux_metrics(outputs)
         if (
             scheduler is not None
             and getattr(scheduler, "step_when", None) == "epoch"
@@ -460,11 +475,6 @@ class ModelWrapper(ModelBase):
         train_metrics = {}
         if loss is not None:
             train_metrics["loss"] = loss_value
-        if aux_metrics is not None:
-            assert (
-                "loss" not in aux_metrics
-            ), "Can not return key `loss` from `aux_metrics`"
-            train_metrics.update(aux_metrics)
         return outputs, train_metrics
 
     def log_step(self):
@@ -476,6 +486,7 @@ class ModelWrapper(ModelBase):
         This method is update the logger with the current metrics and log a status message.
         """
         self.logger.update(self.metrics)
+        self.update_status()
         msg = self.status_message()
         verbose = self.verbose == "console"
         self.logger.info(msg, verbose=verbose)
@@ -486,7 +497,7 @@ class ModelWrapper(ModelBase):
         run_config: ty.Optional[RunConfig] = None,
         run_async=True,
         block: bool = True,
-    ) -> mp.Process | TrainMetrics:
+    ) -> mp.Process | dict[str, float]:
         """
         Mock train the model as a smoke test
 
@@ -503,7 +514,7 @@ class ModelWrapper(ModelBase):
         -------
         p: mp.Process
             The process running the mock train.
-        metrics: TrainMetrics
+        metrics: dict[str, float]
             The metrics from the mock train.
         """
         mock_model = copy.deepcopy(self)
@@ -523,23 +534,40 @@ class ModelWrapper(ModelBase):
         Update the metrics with current training stats,
         and then all metrics (static and moving average) will be set as description for the ``tqdm`` progress.
         """
-        self.metrics.update_static_metrics(self.train_stats)
-        if self.verbose != "tqdm":
+        self.train_metrics.update_static_metrics(self.train_stats)
+        if self.verbose != "progress":
             return
-        rate = self.train_tqdm.format_dict["rate"]
-        time_remaining = "??"
-        if rate is not None and isinstance(rate, (int, float)):
-            time_remaining = self.train_tqdm.format_interval(
-                (self.total_steps - self.current_iteration) / rate
-            )
-        msg = self.status_message()
-        self.train_tqdm.set_description(msg)
-        self.train_tqdm.set_postfix_str(f"Remaining: {time_remaining}")
-        self.train_tqdm.update(1)
+        self.progress_bar.update_metrics(
+            self.metrics, self.current_iteration % self.epoch_len
+        )
+
+    @property
+    def metrics(self) -> dict[str, float]:
+        """
+        The metrics of the current training state.
+        If ``eval_metrics`` are defined (e.g. a validation dataloader was provided)
+        then they are combined and a `val_` and `train_` label is prepended.
+        The current training statistics are also combined
+
+        Returns
+        -------
+        dict[str, float]
+            A dictionary with keys the metric name and the value corresponding to the metric.
+        """
+        metrics = {}
+
+        if self.eval_metrics is not None:
+            for k, v in self.eval_metrics.to_dict().items():
+                metrics[f"val_{k}"] = v
+        for k, v in self.train_metrics.to_dict().items():
+            _k = f"train_{k}" if f"val_{k}" in metrics else k
+            metrics[_k] = v
+        return metrics
 
     def status_message(self) -> str:
         """
-        Return a string generated from dictionary of current metrics,including all the static metrics and moving average metrics.
+        Return a string generated from dictionary of current metrics,
+        including all the static metrics and moving average metrics.
 
         Returns
         -------
@@ -547,16 +575,27 @@ class ModelWrapper(ModelBase):
             The status message.
         """
         # must return current epoch, iter, losses and metrics
-        return " ".join([f"{k}: {v}" for k, v in self.metrics.to_dict().items()])
+        msg_str = ""
+        for k, v in self.metrics.items():
+            msg_str += f"{k}: {butils.num_format(v)} "
+
+        return msg_str.strip()
 
     def log(self):
         """
         Log if the current iteration is a logging step. It also evaluate training metrics for logging.
         """
         # Log step
+        update_interval = 1
         if self._is_step(self.log_itr):
-            self.metrics.evaluate("train", reset=False)
+            self.train_metrics.evaluate(reset=False)
             self.log_step()
+        elif (
+            self.verbose == "progress"
+            and time.time() - self._prev_update_time > update_interval
+        ):
+            self.update_status()
+            self._prev_update_time = 1
 
     @ty.final
     def eval(self, smoke_test=False):
@@ -588,10 +627,18 @@ class ModelWrapper(ModelBase):
         """
         return self.epoch_len * self.epochs
 
+    @property
+    def epochs(self):
+        """
+        The total number of epochs.
+        """
+        return self._epochs
+
     def train_loop(self, smoke_test=False):
         """
         Train the model in many steps, evaluate the model and log the metrics for each iteration.
-        metrics including static metrics like learning rate, along with validation and training metrics like loss and mean.
+        metrics including static metrics like learning rate, along with validation and
+        training metrics like loss and mean.
 
         Parameters
         ----------
@@ -609,22 +656,27 @@ class ModelWrapper(ModelBase):
                 # restart the generator if the previous generator is exhausted.
                 generator = iter(train_dataloader)
                 batch = next(generator)
-                self.metrics.reset("train")
-                self.train_tqdm.reset()
-            outputs, train_metrics = self.train_step(batch)
+                self.train_metrics.evaluate()
+                self.progress_bar.reset()
+            outputs, moving_metrics = self.train_step(batch)
             if outputs is not None:
-                self.metrics.append_batch(**outputs, tag="train")
-            self.metrics.update_ma_metrics(train_metrics, tag="train")
+                try:
+                    self.train_metrics.append_batch(**outputs)
+                except ValueError as e:
+                    raise ValueError(
+                        "Can not store model outputs to metrics. "
+                        "Make sure that the model outputs are formatted correctly. "
+                    ) from e
+            self.train_metrics.update_ma_metrics(moving_metrics)
 
-            if "loss" in train_metrics and not np.isfinite(train_metrics["loss"]):
-                msg = f"Loss Diverged. Terminating. loss: {train_metrics['loss']}"
+            if "loss" in moving_metrics and not np.isfinite(moving_metrics["loss"]):
+                msg = f"Loss Diverged. Terminating. loss: {moving_metrics['loss']}"
                 self.logger.error(msg)
                 raise LossDivergedError(msg)
 
             if not smoke_test:
-                self.update_status()
-                self.log()
                 self.eval()
+                self.log()
 
             if smoke_test and i > self.epoch_len * 0.01:
                 self.eval(smoke_test=True)
@@ -638,7 +690,8 @@ class ModelWrapper(ModelBase):
         smoke_test: bool = False,
         debug: bool = False,
         resume: bool = False,
-    ) -> TrainMetrics:
+        remote_progress_bar: ty.Optional[RemoteProgressBar] = None,
+    ) -> dict[str, float]:
         """
         Initialize states and train the model.
         When keyboard interrupts, saves a checkpoint
@@ -653,20 +706,36 @@ class ModelWrapper(ModelBase):
             Whether to run in debug mode.
         resume : bool, default=False
             Whether to resume training the model from existing checkpoints and existing experiment state.
+        remote_progress_bar : RemoteProgressBar, optional
+            Optionally, we can pass a remote progress bar to report progress of the training.
 
         Returns
         -------
-        TrainMetrics
+        Metrics
             The metrics from the training.
         """
         self._init_state(
-            run_config=run_config, smoke_test=smoke_test, debug=debug, resume=resume
+            run_config=run_config,
+            smoke_test=smoke_test,
+            debug=debug,
+            resume=resume,
+            remote_progress_bar=remote_progress_bar,
         )
 
         try:
             return self.train_loop(smoke_test)
         except KeyboardInterrupt:
             self._checkpoint()
+        finally:
+            self.progress_bar.close()
+
+            msgs = (
+                []
+                if isinstance(self.progress_bar, butils.Dummy)
+                else self.progress_bar.make_metrics_message(self.metrics)
+            )
+            for msg in msgs:
+                self.logger.info(msg, verbose=True)
 
         return self.metrics
 
@@ -686,7 +755,7 @@ class ModelWrapper(ModelBase):
         self._init_state(run_config, resume=True)
         self.logger.info(f"Evaluating {self.current_checkpoint}")
 
-        msg = self.metrics.to_dict()
+        msg = self.train_metrics.to_dict()
         self.logger.info(f"Current metrics: {msg}")
         metrics = {}
         for loader, tag in zip(
@@ -695,24 +764,22 @@ class ModelWrapper(ModelBase):
             if loader is not None:
                 # NOTE we set max memory limit and let it crash because we do not want
                 # inaccurate metrics calculation. Possibly smarter ways to go about it.
-                eval_metrics = TrainMetrics(
+                eval_metrics = Metrics(
                     batch_limit=len(loader) + 1,
                     memory_limit=int(1e9),
                     moving_average_limit=len(loader),
                     evaluation_functions=self.evaluation_functions(),
-                    tags=[tag],
-                    moving_aux_metrics=["loss"] + getattr(self, "aux_metric_names", []),
+                    moving_aux_metrics=["loss"],
                 )
                 self._validation_loop(
                     model=self.model,
                     dataloader=loader,
-                    tag=tag,  # type: ignore
                     metrics=eval_metrics,
                     subsample=1,
                 )
-                metrics[tag] = eval_metrics
-                msg = self.metrics.to_dict()
-                self.logger.info(f"Evaluation: {msg}")
+                metrics[tag] = eval_metrics.to_dict()
+                msg = eval_metrics.to_dict()
+                self.logger.info(f"Evaluating {tag}: {msg}")
         return metrics
 
     def apply_loss(
@@ -745,6 +812,7 @@ class ModelWrapper(ModelBase):
             The loss value.
         """
         if loss is not None:
+            # pylint: disable=no-member
             loss = torch.mean(loss)
             if self.amp:
                 scaler.scale(loss).backward()
@@ -772,21 +840,14 @@ class ModelWrapper(ModelBase):
         self,
         model: nn.Module,
         dataloader: DataLoader,
-        metrics: TrainMetrics,
-        tag: ty.Literal["train", "test", "val"],
+        metrics: Metrics,
         subsample: float = 1.0,
         smoke_test: bool = False,
     ) -> dict[str, float]:
         was_training = model.training
         model.eval()
-        if (batch_lim := metrics.__batch_limit__) < len(dataloader):
-            self.logger.warn(
-                f"Metrics batch-limit {batch_lim} is smaller than "
-                f"the validation dataloader length {len(dataloader)}. "
-                "Consider increasing `metrics_n_batches`."
-            )
         metrics_dict = self.validation_loop(
-            model, dataloader, metrics, tag, subsample, smoke_test
+            model, dataloader, metrics, subsample, smoke_test
         )
         if was_training:
             model.train()
@@ -796,14 +857,12 @@ class ModelWrapper(ModelBase):
         self,
         model: nn.Module,
         dataloader: DataLoader,
-        metrics: TrainMetrics,
-        tag: ty.Literal["train", "test", "val"],
+        metrics: Metrics,
         subsample: float = 1.0,
         smoke_test: bool = False,
     ) -> dict[str, float]:
         """
-        Validate the model on data in dataloader (which can either be val dataloader
-        - so tag is ``val``, or test dataloader - so tag is ``test``)
+        Validate the model on data on dataloader and store results on metrics.
 
         Parameters
         ----------
@@ -811,10 +870,8 @@ class ModelWrapper(ModelBase):
             The model to validate.
         dataloader: DataLoader
             The dataloader to use for validation.
-        metrics: TrainMetrics
+        metrics: Metrics
             The metrics to use for validation.
-        tag: ty.Literal["train", "test", "val"]
-            The tag to use for validation. Also see ``TrainMetrics`` for details.
         subsample: float
             The fraction of the dataloader to use for validation.
         smoke_test: bool
@@ -836,29 +893,22 @@ class ModelWrapper(ModelBase):
                 outputs, loss = self._model_step(model=model, batch=batch)
                 val_metrics = {}
                 if outputs is not None:
-                    aux_metrics = self.aux_metrics(outputs)
-                    metrics.append_batch(tag=tag, **outputs)
-                    if aux_metrics is not None:
-                        assert (
-                            "loss" not in aux_metrics
-                        ), "Invalid return key `loss` from `aux_metrics`"
-                        val_metrics.update(aux_metrics)
+                    metrics.append_batch(**outputs)
                 if loss is not None:
+                    # pylint: disable=no-member
                     val_metrics["loss"] = torch.mean(loss).item()
 
-                metrics.update_ma_metrics(val_metrics, tag=tag)
+                metrics.update_ma_metrics(val_metrics)
                 if i > cutoff_itr or smoke_test:
                     break
-        metrics.evaluate(tag)
-        metrics_dict = {
-            k: v for k, v in metrics.to_dict().items() if k.startswith(f"{tag}_")
-        }
-        return metrics_dict
+        metrics.evaluate()
+        return metrics.to_dict()
 
     @abstractmethod
     def make_dataloader_train(self, run_config: RunConfig) -> DataLoader:
         """
-        Function to make the training dataloader.
+        Function to make the training dataloader. You must overwrite this function and
+        return the training dataloader.
 
         Parameters
         ----------
@@ -869,23 +919,92 @@ class ModelWrapper(ModelBase):
         -------
         DataLoader
             The training dataloader.
+
+        Examples
+        --------
+        >>> class MyModelWrapper(ModelWrapper):
+        >>>     def __init__(self, *args, **kwargs):
+        >>>         super().__init__(*args, **kwargs)
+        >>>     def make_dataloader_train(self, run_config: CustomRunConfig):
+        >>>         return torch.utils.data.DataLoader(
+        ...             train_dataset,
+        ...             batch_size=32,
+        ...             shuffle=True
+        ...         )
+        >>>     def make_dataloader_val(self, run_config: CustomRunConfig):
+        >>>         return torch.utils.data.DataLoader(
+        ...             test_dataset,
+        ...             batch_size=32,
+        ...             shuffle=False
+        ...         )
         """
-        pass
 
     def evaluation_functions(self) -> dict[str, Callable] | None:
         """
+        You can overwrite this function and return the evaluation functions callables
+        that will be used to evaluate experiment metrics.
+        
         Returns
         -------
         dict[str, Callable]
-            The evaluation functions to use.Also see ``TrainMetrics`` for details.
-        """
+            The evaluation functions to use. Also see ``Metrics`` for details.
+        
+        Examples
+        --------
 
-        return None
+        - Define the callables:
+
+        >>> def my_accuracy(y_true, y_pred):
+        >>>     return accuracy_score(y_true.flatten(), y_pred.flatten())
+        >>> def my_f1_score(y_true, y_pred):
+        >>>     return f1_score(y_true.flatten(), y_pred.flatten(), average='weighted')
+
+        - Returns callables in ``evaluation_functions``:
+
+        >>> class MyModelWrapper(ModelWrapper):
+        >>>     def __init__(self, *args, **kwargs):
+        >>>         super().__init__(*args, **kwargs)
+        >>>     def make_dataloader_train(self, run_config: CustomRunConfig):
+        >>>         return torch.utils.data.DataLoader(
+        ...             train_dataset,
+        ...             batch_size=32,
+        ...             shuffle=True
+        ...         )
+        >>>     def make_dataloader_val(self, run_config: CustomRunConfig):
+        >>>         return torch.utils.data.DataLoader(
+        ...             val_dataset,
+        ...             batch_size=32,
+        ...             shuffle=False
+        ...         )
+        >>>     def evaluation_functions(self):
+        >>>         return {
+        ...             "accuracy": my_accuracy,
+        ...             "f1": my_f1_score
+        ...         }
+
+        - Note that the callable's parameter names must match the model's forward output. In our example,
+          ``y_true`` and ``y_pred`` must be returned by the model's forward method:
+        
+        >>> class MyModel(nn.Module):
+        >>>     def __init__(self, config: CustomModelConfig) -> None:
+        >>>         super().__init__()
+        >>>         self.model = FashionMNISTModel(config)
+        >>>         self.loss = nn.CrossEntropyLoss()
+        >>>     def forward(self, x, labels=None):
+        >>>         out = self.model(x)
+        >>>         loss = None
+        >>>         if labels is not None:
+        >>>             loss = self.loss(out, labels)
+        >>>         out = out.argmax(dim=-1)
+        >>>         return {"y_pred": out, "y_true": labels}, loss
+
+        """
 
     # Functions that can be optionally over-written.
     def make_dataloader_test(self, run_config: RunConfig) -> DataLoader | None:
         """
-        Function to make the test dataloader.
+        Function to make the test dataloader. You can overwrite this function and
+        return the test dataloader.
 
         Parameters
         ----------
@@ -896,12 +1015,31 @@ class ModelWrapper(ModelBase):
         -------
         DataLoader | None
             The test dataloader.
+
+        Examples
+        --------
+        >>> class MyModelWrapper(ModelWrapper):
+        >>>     def __init__(self, *args, **kwargs):
+        >>>         super().__init__(*args, **kwargs)
+        >>>     def make_dataloader_train(self, run_config: CustomRunConfig):
+        >>>         return torch.utils.data.DataLoader(
+        ...             train_dataset,
+        ...             batch_size=32,
+        ...             shuffle=True
+        ...         )
+        >>>     def make_dataloader_test(self, run_config: CustomRunConfig):
+        >>>         return torch.utils.data.DataLoader(
+        ...             test_dataset,
+        ...             batch_size=32,
+        ...             shuffle=False
+        ...         )
+
         """
-        pass
 
     def make_dataloader_val(self, run_config: RunConfig) -> DataLoader | None:
         """
-        Function to make the validation dataloader.
+        Function to make the validation dataloader. You can overwrite this function and
+        return the validation dataloader.
 
         Parameters
         ----------
@@ -912,40 +1050,41 @@ class ModelWrapper(ModelBase):
         -------
         DataLoader | None
             The validation dataloader.
+
+        Examples
+        --------
+        >>> class MyModelWrapper(ModelWrapper):
+        >>>     def __init__(self, *args, **kwargs):
+        >>>         super().__init__(*args, **kwargs)
+        >>>     def make_dataloader_train(self, run_config: CustomRunConfig):
+        >>>         return torch.utils.data.DataLoader(
+        ...             train_dataset,
+        ...             batch_size=32,
+        ...             shuffle=True
+        ...         )
+        >>>     def make_dataloader_val(self, run_config: CustomRunConfig):
+        >>>         return torch.utils.data.DataLoader(
+        ...             val_dataset,
+        ...             batch_size=32,
+        ...             shuffle=False
+        ...         )
         """
-        pass
-
-    def custom_evaluation(
-        self, model: nn.Module, dataloader: Iterable
-    ) -> ty.Optional[dict[str, ty.Any]]:
-        pass
-
-    def aux_metrics(
-        self, output_dict: dict[str, torch.Tensor] | None
-    ) -> ty.Optional[dict[str, ty.Any]]:
-        """
-        Auxiliary metrics to be computed during training.
-
-        Parameters
-        ----------
-        output_dict: dict[str, torch.Tensor] | None
-            The output dictionary from the model.
-
-        Returns
-        -------
-        ty.Optional[dict[str, ty.Any]]
-            The auxiliary metrics.
-
-        Notes
-        -----
-        Auxiliary metrics are computed during training and are used for ``moving_aux_metrics`` in ``TrainMetrics``.
-        Check ``TrainMetrics`` for more details.
-        """
-        pass
 
     def config_parser(self, run_config: RunConfig):
         """
-        Used to initialize Derived properties
+        You can overwrite this function to initialize ``Derived`` properties that are not decided
+        until the experiment is launched.
+
+        Examples
+        --------
+        For example, in GPT2 model, we need to resize its vocabulary size to match the tokenizer's
+        vocabulary size depending on the tokenizer used. This is decided only after the experiment has
+        been launched. The reason for this is that you might want to run ablation study on different tokenizers:
+
+        >>> class MyLMWrapper(ModelWrapper):
+        ...    def config_parser(self, run_config: RunConfig):
+        ...        run_config.model_config.resize_token_embedding = len(self.train_dataloader.dataset.tokenizer)
+        ...        return run_config
         """
         return run_config
 
@@ -955,7 +1094,9 @@ class ModelWrapper(ModelBase):
         dataloaders are pickled with the object when running distributed.
         """
         self.train_dataloader = self.make_dataloader_train(run_config)
+        # pylint: disable=assignment-from-no-return
         self.val_dataloader = self.make_dataloader_val(run_config)
+        # pylint: disable=assignment-from-no-return
         self.test_dataloader = self.make_dataloader_test(run_config)
 
     def checkpoint(self, is_best=False):
@@ -977,8 +1118,10 @@ class ModelWrapper(ModelBase):
 
     def save_dict(self) -> dict[str, ty.Any]:
         """
-        Save the current state of the trainer, including model parameters,
-        and current states of the optimizer, the scaler, and the scheduler.
+        Save the current state of the trainer, including model parameters, the current states of the optimizer,
+        scaler, and scheduler. You can overwrite this function and ``create_model()`` to customize the saving and
+        loading of the model, optimizer, and scheduler to your needs. An example of this is shown in
+        :ref:`Saving and loading multi-module models <multi_module_models>` tutorial.
 
         Returns
         -------
