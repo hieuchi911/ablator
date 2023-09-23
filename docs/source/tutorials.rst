@@ -6,6 +6,7 @@ Ablator Tutorials
    :maxdepth: 1
    :caption: Basic Tutorials
 
+   notebooks/Introduction.ipynb
    notebooks/Environment-settings.ipynb
    notebooks/Configuration-Basics.ipynb
    notebooks/Prototyping-models.ipynb
